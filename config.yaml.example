@@ -1,0 +1,18 @@
+# Copy to config.yaml and fill in. Not required by any code yet —
+# this is a placeholder for whichever of the two shapes you land on
+# (see the README "before you build" section): a fixed watchlist of
+# entities you track, or a generic drop-any-PDF-in tool.
+
+ollama:
+  host: http://localhost:11434
+  model: hermes4-14b
+
+storage:
+  db_path: data/financials.db
+
+# If you're tracking a fixed watchlist rather than building a generic
+# tool, list entities here so ingest.py can validate --entity against
+# a known set instead of accepting free text.
+entities: []
+#  - name: "Example Ltd"
+#    doc_types: [sebi_annual, sebi_quarterly]

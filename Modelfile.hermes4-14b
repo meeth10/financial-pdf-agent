@@ -1,0 +1,33 @@
+# Hermes 4 14B is not in the official Ollama library (no one-line
+# `ollama pull`), so it's imported from the GGUF quant on Hugging Face.
+#
+# Simplest path — Ollama can pull GGUF files directly from Hugging Face:
+#
+#   ollama pull hf.co/bartowski/NousResearch_Hermes-4-14B-GGUF:Q4_K_M
+#   ollama cp hf.co/bartowski/NousResearch_Hermes-4-14B-GGUF:Q4_K_M hermes4-14b
+#
+# If that direct-pull syntax isn't working on your Ollama version, fall
+# back to downloading the GGUF yourself and building from this Modelfile:
+#
+#   huggingface-cli download bartowski/NousResearch_Hermes-4-14B-GGUF \
+#       --include "NousResearch_Hermes-4-14B-Q4_K_M.gguf" --local-dir ./models
+#   ollama create hermes4-14b -f Modelfile.hermes4-14b
+#
+# Q4_K_M is ~9GB and the right default for a 12-16GB card. If you have
+# more headroom, swap in Q5_K_M or Q8_0 from the same repo for higher
+# fidelity on the validation/cross-check steps.
+
+FROM ./models/NousResearch_Hermes-4-14B-Q4_K_M.gguf
+
+PARAMETER temperature 0.1
+PARAMETER num_ctx 32768
+
+# Hermes 4 uses ChatML. Ollama's GGUF import usually picks this up from
+# the file's embedded template metadata — only uncomment below if tool
+# calls come back malformed.
+# TEMPLATE """{{ if .System }}<|im_start|>system
+# {{ .System }}<|im_end|>
+# {{ end }}{{ if .Prompt }}<|im_start|>user
+# {{ .Prompt }}<|im_end|>
+# {{ end }}<|im_start|>assistant
+# """
