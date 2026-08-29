@@ -1,18 +1,6 @@
-"""The agent loop.
+"""Ollama tool-calling agent over the structured financial store."""
 
-Deliberately not the fully-autonomous OpenAI-Agents-SDK style loop —
-see the guide's own advice to start with a single agent and a plain
-while-loop before reaching for orchestration frameworks. This is that
-loop, aimed at a local Ollama endpoint instead of the OpenAI API.
-
-Cheapest-path-first: if the question maps cleanly onto a single
-deterministic lookup, you don't need this file at all — call
-tools.get_line_item() directly from a CLI or notebook. Reserve this
-loop for genuinely ambiguous questions (unclear metric name, missing
-period, needs cross-checking, needs a derived calculation, or needs a
-narrative answer synthesized from more than one lookup).
-"""
-
+import argparse
 import json
 import sqlite3
 
@@ -21,8 +9,8 @@ from ollama import Client
 from .system_prompt import SYSTEM_PROMPT
 from .tools import TOOL_SCHEMAS, DISPATCH
 
-DEFAULT_MODEL = "hermes4-14b"
-MAX_TURNS = 8  # stop condition — see the guide's "when to stop" rule
+DEFAULT_MODEL = "hermes3:8b"
+MAX_TURNS = 8
 
 
 def ask(conn: sqlite3.Connection, question: str, model: str = DEFAULT_MODEL,
@@ -46,7 +34,6 @@ def ask(conn: sqlite3.Connection, question: str, model: str = DEFAULT_MODEL,
         tool_calls = message.get("tool_calls")
         if not tool_calls:
             content = message.get("content", "")
-            # strip Hermes 4's hybrid-mode <think> block if present
             if "<think>" in content and "</think>" in content:
                 content = content.split("</think>", 1)[1].strip()
             return content
@@ -55,27 +42,27 @@ def ask(conn: sqlite3.Connection, question: str, model: str = DEFAULT_MODEL,
             name = call["function"]["name"]
             args = call["function"]["arguments"]
             if isinstance(args, str):
-                args = json.loads(args)
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
             fn = DISPATCH.get(name)
             if fn is None:
                 result = {"status": "error", "message": f"unknown tool {name}"}
             else:
                 result = fn(conn, **args)
-            messages.append({
-                "role": "tool",
-                "content": json.dumps(result),
-            })
+            messages.append({"role": "tool", "content": json.dumps(result)})
 
-    return "Stopped after max turns without a final answer — see message history for the last state."
+    return "Stopped after max turns without a final answer."
 
 
 if __name__ == "__main__":
-    import sys
-    from store.schema import init_db
+    parser = argparse.ArgumentParser()
+    parser.add_argument("db_path")
+    parser.add_argument("question", nargs="+")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    args = parser.parse_args()
 
-    if len(sys.argv) < 3:
-        print("usage: python -m agent.run <db_path> <question>")
-        sys.exit(1)
-
-    conn = init_db(sys.argv[1])
-    print(ask(conn, " ".join(sys.argv[2:])))
+    from src.store.schema import init_db
+    conn = init_db(args.db_path)
+    print(ask(conn, " ".join(args.question), model=args.model))
