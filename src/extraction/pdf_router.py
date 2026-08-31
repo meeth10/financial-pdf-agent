@@ -1,16 +1,15 @@
 """Robust financial-table extraction.
 
 Camelot is treated as a candidate generator, not an oracle. Financial PDFs
-regularly produce a 95-100% Camelot parsing score while still collapsing year
-columns, merging numeric cells, or swallowing footnote text. We therefore run
-multiple Camelot strategies, score the resulting table on financial structure,
-and fall back to a coordinate-aware pdfplumber reconstruction when the table is
-structurally weak.
+regularly produce a high parser score while still collapsing year columns,
+merging numeric cells, or swallowing footnote text. We therefore run multiple
+Camelot strategies, score the result on financial structure, and use
+coordinate-aware pdfplumber reconstruction when the table geometry is weak.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from typing import Optional
 import re
 
@@ -32,7 +31,9 @@ class ExtractedTable:
 
 
 MIN_CHARS_FOR_TEXT_PAGE = 40
+MIN_ACCEPTABLE_SCORE = 0.42
 NUMERIC_RE = re.compile(r"^\(?[-+]?\s*\d[\d,]*(?:\.\d+)?%?\)?$")
+YEAR_RE = re.compile(r"(?:19|20)\d{2}(?:[-/](?:19|20)?\d{2})?$")
 FINANCIAL_TERMS = {
     "revenue", "sales", "income", "profit", "loss", "assets", "liabilities",
     "equity", "cash", "borrowings", "debt", "receivables", "payables",
@@ -54,7 +55,7 @@ def _validate_page(pdf_path: str, page_number: int) -> None:
 
 
 def _clean_rows(rows) -> list[list[str]]:
-    cleaned = []
+    cleaned: list[list[str]] = []
     for row in rows or []:
         r = ["" if v is None else re.sub(r"\s+", " ", str(v)).strip() for v in row]
         while r and not r[-1]:
@@ -66,9 +67,51 @@ def _clean_rows(rows) -> list[list[str]]:
 
 def _looks_numeric(value: str) -> bool:
     s = value.strip().replace("−", "-")
-    if s in {"", "-", "—", "–", "N/A", "na"}:
-        return s in {"-", "—", "–"}
+    if s.lower() in {"n/a", "na"}:
+        return False
+    if s in {"", "-", "—", "–"}:
+        return True
     return bool(NUMERIC_RE.match(s.replace(" ", "")))
+
+
+def _looks_year(value: str) -> bool:
+    s = value.strip().replace(" ", "")
+    if YEAR_RE.match(s):
+        return True
+    # Common financial headers such as "FY25" or "FY 2025-26".
+    return bool(re.match(r"^FY\s*(?:19|20)?\d{2}(?:[-/]\s*(?:19|20)?\d{2})?$", value.strip(), re.I))
+
+
+def _table_stats(rows: list[list[str]]) -> dict[str, float | int]:
+    rows = _clean_rows(rows)
+    widths = [len(r) for r in rows if r]
+    nonempty_widths = [sum(bool(x.strip()) for x in r) for r in rows]
+    width_mode = max(set(nonempty_widths), key=nonempty_widths.count) if nonempty_widths else 0
+    stable_rows = sum(w == width_mode for w in nonempty_widths) / max(len(nonempty_widths), 1)
+    max_width = max(nonempty_widths, default=0)
+    numeric_counts = [sum(_looks_numeric(c) for c in r) for r in rows]
+    numeric_cells = sum(numeric_counts)
+    numeric_rows = sum(n >= 1 for n in numeric_counts)
+    multi_numeric_rows = sum(n >= 2 for n in numeric_counts)
+    year_hits = sum(_looks_year(c) for r in rows[:4] for c in r)
+    text = " ".join(c.lower() for r in rows for c in r)
+    term_hits = sum(text.count(term) for term in FINANCIAL_TERMS)
+    total_hits = sum(text.count(term) for term in TOTAL_TERMS)
+    label_rows = sum(bool(r and any(ch.isalpha() for ch in r[0])) for r in rows)
+    return {
+        "row_count": len(rows),
+        "max_width": max_width,
+        "stable_rows": stable_rows,
+        "numeric_cells": numeric_cells,
+        "numeric_rows": numeric_rows,
+        "multi_numeric_rows": multi_numeric_rows,
+        "year_hits": year_hits,
+        "term_hits": term_hits,
+        "total_hits": total_hits,
+        "label_rows": label_rows,
+        "width_mode": width_mode,
+        "mean_width": sum(widths) / max(len(widths), 1),
+    }
 
 
 def _quality_score(rows: list[list[str]], method_score: float = 0.0) -> tuple[float, list[str]]:
@@ -77,31 +120,49 @@ def _quality_score(rows: list[list[str]], method_score: float = 0.0) -> tuple[fl
     if not rows:
         return 0.0, ["empty_table"]
 
-    nonempty_widths = [sum(bool(x.strip()) for x in r) for r in rows]
-    max_width = max(nonempty_widths, default=0)
-    numeric_cells = sum(_looks_numeric(c) for r in rows for c in r if c.strip())
-    numeric_rows = sum(sum(_looks_numeric(c) for c in r) >= 1 for r in rows)
-    text = " ".join(c.lower() for r in rows for c in r)
-    term_hits = sum(text.count(term) for term in FINANCIAL_TERMS)
-    total_hits = sum(text.count(term) for term in TOTAL_TERMS)
+    s = _table_stats(rows)
+    row_count = int(s["row_count"])
+    max_width = int(s["max_width"])
+    stable_rows = float(s["stable_rows"])
+    numeric_cells = int(s["numeric_cells"])
+    numeric_rows = int(s["numeric_rows"])
+    multi_numeric_rows = int(s["multi_numeric_rows"])
+    year_hits = int(s["year_hits"])
+    term_hits = int(s["term_hits"])
+    total_hits = int(s["total_hits"])
+    label_rows = int(s["label_rows"])
 
     score = 0.0
-    score += min(method_score / 100.0, 1.0) * 0.15
-    score += min(max_width / 5.0, 1.0) * 0.20
-    score += min(numeric_cells / max(len(rows) * 2, 1), 1.0) * 0.25
-    score += min(numeric_rows / max(len(rows), 1), 1.0) * 0.15
-    score += min(term_hits / 8.0, 1.0) * 0.20
-    score += min(total_hits / 3.0, 1.0) * 0.05
+    score += min(method_score / 100.0, 1.0) * 0.10
+    score += min(max_width / 6.0, 1.0) * 0.14
+    score += stable_rows * 0.14
+    score += min(numeric_cells / max(row_count * 2, 1), 1.0) * 0.20
+    score += min(numeric_rows / max(row_count, 1), 1.0) * 0.10
+    score += min(multi_numeric_rows / max(row_count, 1), 1.0) * 0.12
+    score += min(year_hits / 2.0, 1.0) * 0.08
+    score += min(term_hits / 8.0, 1.0) * 0.09
+    score += min(total_hits / 3.0, 1.0) * 0.03
 
     if max_width <= 1 and numeric_cells > 0:
         warnings.append("collapsed_columns")
         score -= 0.35
+    if max_width >= 2 and multi_numeric_rows / max(row_count, 1) < 0.20:
+        warnings.append("mostly_single_value_rows")
+        score -= 0.12
+    if stable_rows < 0.55:
+        warnings.append("unstable_column_count")
+        score -= 0.10
     if numeric_cells == 0:
         warnings.append("no_numeric_cells")
         score -= 0.25
     if numeric_rows < 2:
         warnings.append("too_few_numeric_rows")
         score -= 0.15
+    if label_rows / max(row_count, 1) < 0.45:
+        warnings.append("weak_row_labels")
+        score -= 0.08
+    if year_hits == 0:
+        warnings.append("no_year_header_detected")
 
     return max(0.0, min(score, 1.0)), warnings
 
@@ -165,25 +226,54 @@ def _coordinate_reconstruct(pdf_path: str, page_number: int) -> Optional[Extract
         return None
 
     lines = _group_words_into_lines(words)
+    numeric_x: list[float] = []
+    for line in lines:
+        for w in line:
+            if _looks_numeric(w["text"]):
+                numeric_x.append(float(w["x0"]))
+
+    if not numeric_x:
+        return None
+
+    # Infer numeric column anchors from repeated x coordinates across rows.
+    anchors: list[float] = []
+    for x in sorted(numeric_x):
+        if not anchors or abs(x - anchors[-1]) > 16:
+            anchors.append(x)
+        else:
+            anchors[-1] = (anchors[-1] + x) / 2
+    anchors = anchors[:8]
+
     rows: list[list[str]] = []
     for line in lines:
-        numeric = [w for w in line if _looks_numeric(w["text"])]
-        if not numeric:
+        numeric_words = [w for w in line if _looks_numeric(w["text"])]
+        if not numeric_words:
             continue
 
-        first_num = min(w["x0"] for w in numeric)
-        label_words = [w["text"] for w in line if w["x0"] < first_num - 4]
+        first_num = min(float(w["x0"]) for w in numeric_words)
+        label_words = [w["text"] for w in line if float(w["x0"]) < first_num - 4]
         label = " ".join(label_words).strip()
         if not label:
             continue
 
-        values = [w["text"] for w in numeric]
-        rows.append([label, *values])
+        values = [""] * len(anchors)
+        for w in numeric_words:
+            idx = min(range(len(anchors)), key=lambda i: abs(float(w["x0"]) - anchors[i]))
+            if not values[idx]:
+                values[idx] = w["text"]
+            else:
+                values[idx] += " " + w["text"]
+
+        # Remove empty trailing columns but retain interior gaps.
+        while values and not values[-1]:
+            values.pop()
+        if values:
+            rows.append([label, *values])
 
     if len(rows) < 2:
         return None
 
-    q, warnings = _quality_score(rows, 50.0)
+    q, warnings = _quality_score(rows, 55.0)
     warnings.append("coordinate_reconstruction")
     return ExtractedTable(
         page=page_number,
@@ -230,16 +320,20 @@ def extract_page_tables(pdf_path: str, page_number: int) -> list[ExtractedTable]
     if not candidates:
         return []
 
+    # Discard structurally weak parses unless there is no alternative at all.
     candidates.sort(key=lambda t: (t.quality_score, t.confidence, len(t.rows)), reverse=True)
-    best = candidates[0]
+    viable = [c for c in candidates if c.quality_score >= MIN_ACCEPTABLE_SCORE]
+    if viable:
+        candidates = viable
 
+    best = candidates[0]
     unique: list[ExtractedTable] = [best]
     for candidate in candidates[1:]:
-        if candidate.quality_score < max(best.quality_score - 0.15, 0.0):
+        if candidate.quality_score < max(best.quality_score - 0.12, MIN_ACCEPTABLE_SCORE):
             continue
         shape_a = (len(best.rows), max((len(r) for r in best.rows), default=0))
         shape_b = (len(candidate.rows), max((len(r) for r in candidate.rows), default=0))
-        if shape_a != shape_b:
+        if shape_a != shape_b or candidate.method != best.method:
             unique.append(candidate)
         if len(unique) >= 2:
             break
