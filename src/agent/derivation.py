@@ -40,8 +40,8 @@ def canonicalize_metric(metric: str) -> str:
     return metric.strip().lower().replace(" ", "_")
 
 
-def _lookup(conn, entity: str, metric: str, period: str, statement: str | None,
-            consolidated: bool | None) -> dict[str, Any]:
+def _direct_lookup(conn, entity: str, metric: str, period: str, statement: str | None,
+                   consolidated: bool | None) -> dict[str, Any]:
     canonical = canonicalize_metric(metric)
     rows = db.get_line_item(conn, entity, canonical, period, statement, consolidated)
     if not rows:
@@ -63,11 +63,12 @@ def _lookup(conn, entity: str, metric: str, period: str, statement: str | None,
 
 
 def _same_unit(inputs: list[dict[str, Any]]) -> bool:
-    units = {str(x.get("unit") or "").strip().lower() for x in inputs}
+    units = {str(x.get("unit") or "").strip().lower() for x in inputs
+             if x.get("status") in {"REPORTED", "DERIVED"}}
     return len(units) <= 1
 
 
-def _calc_expression(name: str, values: dict[str, float]) -> float | None:
+def _calc_expression(name: str, values: dict[str, float]) -> float:
     if name == "gross_profit":
         return values["revenue"] - values["cost_of_revenue"]
     if name == "ebitda":
@@ -102,9 +103,6 @@ def _calc_expression(name: str, values: dict[str, float]) -> float | None:
         return values["operating_cash_flow"] / values["ebitda"] * 100
     if name == "cfo_to_pat":
         return values["operating_cash_flow"] / values["net_income"] * 100
-    if name in {"revenue_growth", "ebitda_growth", "pat_growth"}:
-        key = {"revenue_growth": "revenue", "ebitda_growth": "ebitda", "pat_growth": "net_income"}[name]
-        return (values[f"{key}_current"] / values[f"{key}_prior"] - 1) * 100
     raise ValueError(f"Formula not implemented: {name}")
 
 
@@ -117,13 +115,14 @@ def _confidence_level(inputs: list[dict[str, Any]]) -> str:
     return "HIGH"
 
 
-def calculate_metric(conn, entity: str, metric: str, period: str,
-                     statement: str | None = None,
-                     consolidated: bool | None = None) -> dict[str, Any]:
+def _resolve(conn, entity: str, metric: str, period: str, statement: str | None,
+             consolidated: bool | None, stack: tuple[str, ...]) -> dict[str, Any]:
     requested = canonicalize_metric(metric)
+    if requested in stack:
+        return {"status": "CONFLICTED", "metric": requested, "period": period,
+                "reason": "cyclic rule dependency"}
 
-    # Direct retrieval always wins over a calculation.
-    direct = _lookup(conn, entity, requested, period, statement, consolidated)
+    direct = _direct_lookup(conn, entity, requested, period, statement, consolidated)
     if direct.get("status") == "REPORTED":
         return direct
     if requested not in _RULES.get("formulas", {}):
@@ -133,11 +132,11 @@ def calculate_metric(conn, entity: str, metric: str, period: str,
     inputs: list[dict[str, Any]] = []
     values: dict[str, float] = {}
     for input_metric in formula_spec["inputs"]:
-        item = _lookup(conn, entity, input_metric, period, statement, consolidated)
+        item = _resolve(conn, entity, input_metric, period, statement, consolidated, stack + (requested,))
         inputs.append(item)
-        if item.get("status") != "REPORTED":
+        if item.get("status") not in {"REPORTED", "DERIVED"}:
             return {
-                "status": "UNAVAILABLE" if item.get("status") != "CONFLICTED" else "CONFLICTED",
+                "status": item.get("status", "UNAVAILABLE"),
                 "metric": requested, "period": period,
                 "reason": f"missing or ambiguous input: {input_metric}",
                 "formula": formula_spec["expression"], "inputs": inputs,
@@ -146,15 +145,14 @@ def calculate_metric(conn, entity: str, metric: str, period: str,
 
     if not _same_unit(inputs) and formula_spec.get("unit") not in {"percent", "x"}:
         return {"status": "UNAVAILABLE", "metric": requested, "period": period,
-                "reason": "inputs use incompatible units", "inputs": inputs}
+                "reason": "inputs use incompatible units", "formula": formula_spec["expression"],
+                "inputs": inputs}
 
-    # Multiples with zero/negative EBITDA are not meaningful by policy.
     if requested in {"debt_to_ebitda", "net_debt_to_ebitda"} and values.get("ebitda", 1) <= 0:
         return {"status": "UNAVAILABLE", "metric": requested, "period": period,
                 "reason": "EBITDA is zero or negative; leverage multiple is not meaningful",
                 "formula": formula_spec["expression"], "inputs": inputs}
 
-    # Ratio denominators must not be zero.
     for denom in ("revenue", "current_liabilities", "shareholders_equity", "finance_cost", "ebitda", "net_income"):
         if denom in values and denom in formula_spec["expression"] and values[denom] == 0:
             return {"status": "UNAVAILABLE", "metric": requested, "period": period,
@@ -165,9 +163,10 @@ def calculate_metric(conn, entity: str, metric: str, period: str,
         result = _calc_expression(requested, values)
     except (ZeroDivisionError, ValueError):
         return {"status": "UNAVAILABLE", "metric": requested, "period": period,
-                "reason": "calculation could not be completed", "inputs": inputs}
+                "reason": "calculation could not be completed", "formula": formula_spec["expression"],
+                "inputs": inputs}
 
-    if result is None or not math.isfinite(result):
+    if not math.isfinite(result):
         return {"status": "UNAVAILABLE", "metric": requested, "period": period,
                 "reason": "non-finite calculation result", "inputs": inputs}
 
@@ -175,11 +174,16 @@ def calculate_metric(conn, entity: str, metric: str, period: str,
     return {
         "status": "DERIVED", "metric": requested, "value": round(result, 6),
         "unit": formula_spec.get("unit") or inputs[0].get("unit"),
-        "period": period, "statement": statement,
-        "consolidated": consolidated, "confidence": _confidence_level(inputs),
-        "formula": formula_spec["expression"], "inputs": inputs,
-        "source_pages": source_pages,
+        "period": period, "statement": statement, "consolidated": consolidated,
+        "confidence": _confidence_level(inputs), "formula": formula_spec["expression"],
+        "inputs": inputs, "source_pages": source_pages,
     }
+
+
+def calculate_metric(conn, entity: str, metric: str, period: str,
+                     statement: str | None = None,
+                     consolidated: bool | None = None) -> dict[str, Any]:
+    return _resolve(conn, entity, metric, period, statement, consolidated, ())
 
 
 def calculate_growth(conn, entity: str, metric: str, current_period: str,
@@ -192,12 +196,13 @@ def calculate_growth(conn, entity: str, metric: str, current_period: str,
         return {"status": "UNAVAILABLE", "metric": base,
                 "reason": "growth rule not defined for this metric"}
 
-    current = _lookup(conn, entity, base, current_period, statement, consolidated)
-    prior = _lookup(conn, entity, base, prior_period, statement, consolidated)
+    current = _resolve(conn, entity, base, current_period, statement, consolidated, ())
+    prior = _resolve(conn, entity, base, prior_period, statement, consolidated, ())
     inputs = [current, prior]
-    if any(x.get("status") != "REPORTED" for x in inputs):
+    if any(x.get("status") not in {"REPORTED", "DERIVED"} for x in inputs):
         return {"status": "UNAVAILABLE", "metric": growth_metric,
                 "reason": "current or prior value unavailable", "inputs": inputs}
+
     current_value = float(current["value"])
     prior_value = float(prior["value"])
     if prior_value == 0 or prior_value < 0:
