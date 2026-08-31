@@ -13,7 +13,7 @@ from typing import Any
 
 from ollama import Client
 
-DEFAULT_MODEL = "hermes3:8b"
+DEFAULT_MODEL = "ornith:9b"
 
 _NUMBER_RE = re.compile(
     r"(?<![A-Za-z])(?:\$|€|£|₹)?\s*"
