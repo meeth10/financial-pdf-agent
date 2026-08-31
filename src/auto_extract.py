@@ -14,32 +14,28 @@ STATEMENTS = ("balance_sheet", "income_statement", "cash_flow")
 
 
 def extract_financial_statements(pdf_path: str, *, top_k: int = 3) -> dict[str, Any]:
-    """Discover statement pages and run the existing table extraction router."""
+    """Discover statement pages and run the robust table extraction router."""
     discovered = discover_statement_pages(pdf_path, top_k=top_k)
     output: dict[str, Any] = {"pdf": str(Path(pdf_path)), "statements": {}}
 
     for statement in STATEMENTS:
-        rows: list[dict[str, Any]] = []
+        pages_out: list[dict[str, Any]] = []
         for candidate in discovered[statement]:
             page = candidate.page
+            needs_ocr = page_needs_ocr(pdf_path, page)
             page_result: dict[str, Any] = {
                 "page": page,
                 "score": candidate.score,
                 "matched_terms": list(candidate.matched_terms),
                 "text_preview": candidate.text_preview,
-                "needs_ocr": page_needs_ocr(pdf_path, page),
+                "needs_ocr": needs_ocr,
                 "tables": [],
             }
-            if not page_result["needs_ocr"]:
+            if not needs_ocr:
                 for table in extract_page_tables(pdf_path, page):
-                    page_result["tables"].append({
-                        "rows": table.rows,
-                        "method": table.method,
-                        "confidence": table.confidence,
-                        "caption": table.table_caption,
-                    })
-            rows.append(page_result)
-        output["statements"][statement] = rows
+                    page_result["tables"].append(asdict(table))
+            pages_out.append(page_result)
+        output["statements"][statement] = pages_out
 
     return output
 
@@ -51,4 +47,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     import json
-    print(json.dumps(extract_financial_statements(args.pdf_path, top_k=args.top_k), indent=2, default=str))
+    print(json.dumps(extract_financial_statements(args.pdf_path, top_k=args.top_k), indent=2, ensure_ascii=False))
