@@ -1,26 +1,18 @@
-"""Per-page table extraction router.
+"""Robust financial-table extraction.
 
-Tested against a real borderless table (not a financial statement, but
-representative of the problem): pdfplumber's default line-based
-strategy returns nothing on borderless tables, and its text-based
-strategy over-splits words into garbled columns. Camelot's *stream*
-mode (whitespace-based, not just lattice/line-based) correctly
-recovered the 3-column structure with a 97%+ self-reported accuracy
-score. So the priority order here is:
-
-    1. Camelot lattice  (bordered tables — most 10-K / SEBI statement pages)
-    2. Camelot stream    (borderless tables — investor decks, some notes)
-    3. pdfplumber        (fallback + fine-grained control for edge cases)
-    4. OCR flag          (page returned near-empty text — likely scanned)
-
-Camelot's own `parsing_report['accuracy']` is used as the confidence
-score that flows into `extraction_confidence` in the store — this is
-what lets the agent's Confidence: HIGH/MEDIUM/LOW field mean something
-real instead of being guessed by the LLM.
+Camelot is treated as a candidate generator, not an oracle. Financial PDFs
+regularly produce a 95-100% Camelot parsing score while still collapsing year
+columns, merging numeric cells, or swallowing footnote text. We therefore run
+multiple Camelot strategies, score the resulting table on financial structure,
+and fall back to a coordinate-aware pdfplumber reconstruction when the table is
+structurally weak.
 """
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
 from typing import Optional
+import re
 
 import pdfplumber
 
@@ -29,73 +21,233 @@ import pdfplumber
 class ExtractedTable:
     page: int
     rows: list[list[str]]
-    method: str            # camelot_lattice | camelot_stream | pdfplumber
-    confidence: float      # 0-1
+    method: str
+    confidence: float
     table_caption: Optional[str] = None
+    quality_score: float = 0.0
+    warnings: list[str] | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
-MIN_CAMELOT_ACCURACY = 80.0   # below this, don't trust the table — try the next method
-MIN_CHARS_FOR_TEXT_PAGE = 40  # below this, flag the page as likely scanned
+MIN_CHARS_FOR_TEXT_PAGE = 40
+NUMERIC_RE = re.compile(r"^\(?[-+]?\s*\d[\d,]*(?:\.\d+)?%?\)?$")
+FINANCIAL_TERMS = {
+    "revenue", "sales", "income", "profit", "loss", "assets", "liabilities",
+    "equity", "cash", "borrowings", "debt", "receivables", "payables",
+    "inventory", "expenses", "tax", "ebit", "ebitda", "operating", "capital",
+    "depreciation", "amortisation", "amortization", "dividend", "earnings",
+}
+TOTAL_TERMS = {"total", "subtotal", "net", "profit", "loss", "ebit", "ebitda"}
+
+
+def _get_page_count(pdf_path: str) -> int:
+    with pdfplumber.open(pdf_path) as pdf:
+        return len(pdf.pages)
+
+
+def _validate_page(pdf_path: str, page_number: int) -> None:
+    count = _get_page_count(pdf_path)
+    if page_number < 1 or page_number > count:
+        raise ValueError(f"Page {page_number} doesn't exist — this PDF has {count} page(s).")
+
+
+def _clean_rows(rows) -> list[list[str]]:
+    cleaned = []
+    for row in rows or []:
+        r = ["" if v is None else re.sub(r"\s+", " ", str(v)).strip() for v in row]
+        while r and not r[-1]:
+            r.pop()
+        if any(r):
+            cleaned.append(r)
+    return cleaned
+
+
+def _looks_numeric(value: str) -> bool:
+    s = value.strip().replace("−", "-")
+    if s in {"", "-", "—", "–", "N/A", "na"}:
+        return s in {"-", "—", "–"}
+    return bool(NUMERIC_RE.match(s.replace(" ", "")))
+
+
+def _quality_score(rows: list[list[str]], method_score: float = 0.0) -> tuple[float, list[str]]:
+    rows = _clean_rows(rows)
+    warnings: list[str] = []
+    if not rows:
+        return 0.0, ["empty_table"]
+
+    nonempty_widths = [sum(bool(x.strip()) for x in r) for r in rows]
+    max_width = max(nonempty_widths, default=0)
+    numeric_cells = sum(_looks_numeric(c) for r in rows for c in r if c.strip())
+    numeric_rows = sum(sum(_looks_numeric(c) for c in r) >= 1 for r in rows)
+    text = " ".join(c.lower() for r in rows for c in r)
+    term_hits = sum(text.count(term) for term in FINANCIAL_TERMS)
+    total_hits = sum(text.count(term) for term in TOTAL_TERMS)
+
+    score = 0.0
+    score += min(method_score / 100.0, 1.0) * 0.15
+    score += min(max_width / 5.0, 1.0) * 0.20
+    score += min(numeric_cells / max(len(rows) * 2, 1), 1.0) * 0.25
+    score += min(numeric_rows / max(len(rows), 1), 1.0) * 0.15
+    score += min(term_hits / 8.0, 1.0) * 0.20
+    score += min(total_hits / 3.0, 1.0) * 0.05
+
+    if max_width <= 1 and numeric_cells > 0:
+        warnings.append("collapsed_columns")
+        score -= 0.35
+    if numeric_cells == 0:
+        warnings.append("no_numeric_cells")
+        score -= 0.25
+    if numeric_rows < 2:
+        warnings.append("too_few_numeric_rows")
+        score -= 0.15
+
+    return max(0.0, min(score, 1.0)), warnings
+
+
+def _camelot_candidates(pdf_path: str, page_number: int) -> list[ExtractedTable]:
+    import camelot
+
+    candidates: list[ExtractedTable] = []
+    strategies = [
+        ("camelot_lattice", "lattice", {"line_scale": 40}),
+        ("camelot_lattice_tight", "lattice", {"line_scale": 60, "process_background": True}),
+        ("camelot_stream", "stream", {"row_tol": 8, "column_tol": 12, "split_text": True}),
+        ("camelot_stream_tight", "stream", {"row_tol": 4, "column_tol": 8, "split_text": True}),
+        ("camelot_stream_loose", "stream", {"row_tol": 10, "column_tol": 20, "split_text": True}),
+    ]
+
+    for label, flavor, kwargs in strategies:
+        try:
+            tables = camelot.read_pdf(pdf_path, pages=str(page_number), flavor=flavor, **kwargs)
+        except Exception:
+            continue
+        for t in tables:
+            raw_acc = float(t.parsing_report.get("accuracy", 0.0))
+            rows = _clean_rows(t.df.values.tolist())
+            q, warnings = _quality_score(rows, raw_acc)
+            candidates.append(ExtractedTable(
+                page=page_number,
+                rows=rows,
+                method=label,
+                confidence=q,
+                quality_score=q,
+                warnings=warnings,
+            ))
+    return candidates
+
+
+def _group_words_into_lines(words: list[dict], y_tol: float = 3.0) -> list[list[dict]]:
+    lines: list[list[dict]] = []
+    for word in sorted(words, key=lambda w: (w["top"], w["x0"])):
+        target = None
+        for line in lines:
+            avg_top = sum(w["top"] for w in line) / len(line)
+            if abs(word["top"] - avg_top) <= y_tol:
+                target = line
+                break
+        if target is None:
+            lines.append([word])
+        else:
+            target.append(word)
+    for line in lines:
+        line.sort(key=lambda w: w["x0"])
+    return lines
+
+
+def _coordinate_reconstruct(pdf_path: str, page_number: int) -> Optional[ExtractedTable]:
+    with pdfplumber.open(pdf_path) as pdf:
+        page = pdf.pages[page_number - 1]
+        words = page.extract_words(x_tolerance=1, y_tolerance=2, keep_blank_chars=False)
+
+    if not words:
+        return None
+
+    lines = _group_words_into_lines(words)
+    rows: list[list[str]] = []
+    for line in lines:
+        numeric = [w for w in line if _looks_numeric(w["text"])]
+        if not numeric:
+            continue
+
+        first_num = min(w["x0"] for w in numeric)
+        label_words = [w["text"] for w in line if w["x0"] < first_num - 4]
+        label = " ".join(label_words).strip()
+        if not label:
+            continue
+
+        values = [w["text"] for w in numeric]
+        rows.append([label, *values])
+
+    if len(rows) < 2:
+        return None
+
+    q, warnings = _quality_score(rows, 50.0)
+    warnings.append("coordinate_reconstruction")
+    return ExtractedTable(
+        page=page_number,
+        rows=rows,
+        method="pdfplumber_coordinates",
+        confidence=q,
+        quality_score=q,
+        warnings=warnings,
+    )
 
 
 def extract_page_tables(pdf_path: str, page_number: int) -> list[ExtractedTable]:
-    """page_number is 1-indexed to match how humans (and your agent's
-    'Source: Page X' output) refer to PDF pages."""
-    results: list[ExtractedTable] = []
+    _validate_page(pdf_path, page_number)
 
-    # Camelot lattice first — cheap, and this is the common case for
-    # bordered balance-sheet / income-statement tables.
-    try:
-        import camelot
-        lattice = camelot.read_pdf(pdf_path, pages=str(page_number), flavor="lattice")
-        for t in lattice:
-            acc = t.parsing_report.get("accuracy", 0.0)
-            if acc >= MIN_CAMELOT_ACCURACY:
-                results.append(ExtractedTable(
-                    page=page_number,
-                    rows=t.df.values.tolist(),
-                    method="camelot_lattice",
-                    confidence=acc / 100.0,
-                ))
-    except Exception:
-        pass  # ghostscript / no lines on page — fall through
+    candidates = _camelot_candidates(pdf_path, page_number)
+    coord = _coordinate_reconstruct(pdf_path, page_number)
+    if coord:
+        candidates.append(coord)
 
-    if not results:
-        try:
-            import camelot
-            stream = camelot.read_pdf(pdf_path, pages=str(page_number), flavor="stream")
-            for t in stream:
-                acc = t.parsing_report.get("accuracy", 0.0)
-                if acc >= MIN_CAMELOT_ACCURACY:
-                    results.append(ExtractedTable(
-                        page=page_number,
-                        rows=t.df.values.tolist(),
-                        method="camelot_stream",
-                        confidence=acc / 100.0,
-                    ))
-        except Exception:
-            pass
-
-    if not results:
-        # Last resort: pdfplumber with widened tolerances. This still
-        # needs per-document tuning — see llm_cleanup.py for the pass
-        # that repairs whatever comes out of here.
+    if not candidates:
         with pdfplumber.open(pdf_path) as pdf:
             page = pdf.pages[page_number - 1]
-            settings = {"vertical_strategy": "text", "horizontal_strategy": "text",
-                        "text_x_tolerance": 3, "text_y_tolerance": 3}
-            for table in page.extract_tables(table_settings=settings):
-                results.append(ExtractedTable(
-                    page=page_number,
-                    rows=table,
-                    method="pdfplumber",
-                    confidence=0.4,  # deliberately low — this path is unverified
-                ))
+            settings_list = [
+                {"vertical_strategy": "lines", "horizontal_strategy": "lines"},
+                {"vertical_strategy": "text", "horizontal_strategy": "text", "text_x_tolerance": 2, "text_y_tolerance": 3},
+            ]
+            for settings in settings_list:
+                try:
+                    tables = page.extract_tables(table_settings=settings)
+                except Exception:
+                    continue
+                for table in tables:
+                    rows = _clean_rows(table)
+                    q, warnings = _quality_score(rows, 40.0)
+                    candidates.append(ExtractedTable(
+                        page=page_number,
+                        rows=rows,
+                        method="pdfplumber",
+                        confidence=q,
+                        quality_score=q,
+                        warnings=warnings,
+                    ))
 
-    return results
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda t: (t.quality_score, t.confidence, len(t.rows)), reverse=True)
+    best = candidates[0]
+
+    unique: list[ExtractedTable] = [best]
+    for candidate in candidates[1:]:
+        if candidate.quality_score < max(best.quality_score - 0.15, 0.0):
+            continue
+        shape_a = (len(best.rows), max((len(r) for r in best.rows), default=0))
+        shape_b = (len(candidate.rows), max((len(r) for r in candidate.rows), default=0))
+        if shape_a != shape_b:
+            unique.append(candidate)
+        if len(unique) >= 2:
+            break
+    return unique
 
 
 def page_needs_ocr(pdf_path: str, page_number: int) -> bool:
+    _validate_page(pdf_path, page_number)
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[page_number - 1]
         text = page.extract_text() or ""
