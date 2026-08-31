@@ -4,12 +4,12 @@ The extraction layer remains the source of numbers. This agent sits above the st
 
 ## Model
 
-Default model: `qwen3:14b`.
+Default model: `ornith:9b`.
 
 Install/pull it once:
 
 ```bash
-ollama pull qwen3:14b
+ollama pull ornith:9b
 ```
 
 The agent uses the model for terminology, question interpretation, and tool selection. Arithmetic is performed by `derivation.py`, not by the model.
@@ -35,7 +35,7 @@ python -m src.agent.run data/financials.db "Calculate free cash flow for FY2025.
 
 ```text
 question
-  -> Qwen3 14B
+  -> Ornith 9B
   -> deterministic retrieval tools
   -> rule-book derivation engine
   -> provenance + confidence
