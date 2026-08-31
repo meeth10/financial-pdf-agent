@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import argparse
+import sys
 import json
 import tempfile
 from pathlib import Path
+
+# Support both `python -m src.webapp` and `python src/webapp.py`.
+# When executed as a script, Python puts `src/` on sys.path rather than
+# the repository root, so the top-level `src` package is otherwise unavailable.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from flask import Flask, jsonify, render_template_string, request
 
@@ -91,5 +99,14 @@ def extract():
     return jsonify(result)
 
 
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the local financial PDF extraction UI")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--no-debug", action="store_true")
+    args = parser.parse_args()
+    app.run(host=args.host, port=args.port, debug=not args.no_debug)
+
+
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    main()
