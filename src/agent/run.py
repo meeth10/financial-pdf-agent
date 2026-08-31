@@ -9,11 +9,9 @@ from ollama import Client
 from .system_prompt import SYSTEM_PROMPT
 from .tools import TOOL_SCHEMAS, DISPATCH
 
-# Qwen3 14B is the default reasoning model: strong enough for financial
-# terminology/tool selection while remaining practical for local Apple
-# Silicon inference. Arithmetic is still delegated to deterministic tools.
-DEFAULT_MODEL = "qwen3:14b"
-MAX_TURNS = 10
+# Lightweight but capable local agent. Arithmetic remains deterministic.
+DEFAULT_MODEL = "ornith:9b"
+MAX_TURNS = 8
 
 
 def ask(conn: sqlite3.Connection, question: str, model: str = DEFAULT_MODEL,
